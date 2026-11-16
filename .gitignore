@@ -1,0 +1,8 @@
+.env
+data/
+bot_media/
+*.db
+*.db-*
+__pycache__/
+venv/
+.venv/

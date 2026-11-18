@@ -5,7 +5,7 @@ Spy Chat Bot — архив бизнес-чатов Telegram.
 и присылает владельцу удалённые (и, по желанию, изменённые) сообщения.
 
 Команды владельца: /settings /search /export /stats /history
-Команды админа:    /backup
+Команды админа:    /admin /backup /givepremium /refund
 """
 from __future__ import annotations
 
@@ -66,7 +66,9 @@ DB_PATH = os.getenv("DB_PATH", "bot_archive.db")
 MEDIA_DIR = os.getenv("MEDIA_DIR", "bot_media")
 TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Asia/Tashkent"))
 RETENTION_DAYS = max(1, _env_int("RETENTION_DAYS", 30))  # через сколько дней удалять ВСЕ данные
-BACKUP_HOUR = _env_int("BACKUP_HOUR", 4)    # во сколько (по TIMEZONE) присылать бэкап
+BACKUP_HOUR = _env_int("BACKUP_HOUR", 4)    # во сколько (по TIMEZONE) делать бэкап
+BACKUP_KEEP = max(1, _env_int("BACKUP_KEEP", 7))  # сколько последних бэкапов хранить на сервере
+BACKUP_DIR = os.getenv("BACKUP_DIR") or os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "backups")
 CLEANUP_HOUR = _env_int("CLEANUP_HOUR", 5)  # во сколько удалять старые данные
 MAX_DOWNLOAD_MB = min(_env_int("MAX_DOWNLOAD_MB", 20), 20)  # Bot API не скачивает файлы > 20 МБ
 MEDIA_QUOTA_MB = _env_int("MEDIA_QUOTA_MB", 500)            # лимит медиа на одного владельца
@@ -826,19 +828,17 @@ def buy_button(text: Optional[str] = None) -> Btn:
 
 
 def message_kb(ref_id: int, chat_id: int) -> InlineKeyboardMarkup:
-    """Кнопки под уведомлением для Премиум."""
+    """Компактные кнопки под историей сообщения."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [Btn(text="📜 Вся история", callback_data=f"h:{ref_id}"),
-         Btn(text="🔇 Не следить за чатом", callback_data=f"mc:{chat_id}")],
-        [Btn(text="🗑 Удалить из архива", callback_data=f"d:{ref_id}")],
+        [Btn(text="🔇 Скрыть чат", callback_data=f"mc:{chat_id}"),
+         Btn(text="🗑 Удалить", callback_data=f"d:{ref_id}")],
     ])
 
 
 def free_kb(chat_id: int) -> InlineKeyboardMarkup:
     """Кнопки под уведомлением для бесплатного тарифа."""
     return InlineKeyboardMarkup(inline_keyboard=[
-        [buy_button("⭐ Узнать, что там было — Премиум")],
-        [Btn(text="🔇 Не следить за чатом", callback_data=f"mc:{chat_id}")],
+        [buy_button("⭐ Узнать, что там было")],
     ])
 
 
@@ -855,8 +855,9 @@ def deleted_text(row, versions: list) -> str:
         head.append(f"✏️ <b>Изменялось:</b> {n} {plural(n, 'раз', 'раза', 'раз')}")
     head += ["", "📝 <b>Текст / подпись:</b>"]
     header = "\n".join(head)
+    footer = f"\n\n📜 История: /h{row['id']}"
     last = versions[-1]["text"] if versions else "—"
-    return f"{header}\n{fit(last, 3900 - len(header))}"
+    return f"{header}\n{fit(last, 3900 - len(header) - len(footer))}{footer}"
 
 
 def edited_text(row, old: Optional[str], new: str) -> str:
@@ -867,6 +868,7 @@ def edited_text(row, old: Optional[str], new: str) -> str:
         f"💬 <b>Чат:</b> {esc(row['chat_title']) if row else '—'}\n\n"
         f"<b>Было:</b>\n{old_part}\n\n"
         f"<b>Стало:</b>\n{fit(new, 1700)}"
+        + (f"\n\n📜 История: /h{row['id']}" if row else "")
     )
 
 
@@ -993,8 +995,7 @@ async def on_edited_business_message(message: Message, bot: Bot):
         return
     silent = bool(st["quiet_night"]) and is_quiet_time()
     if premium:
-        kb = message_kb(row["id"], message.chat.id) if row else None
-        await deliver(bot, owner.chat_id, edited_text(row, old_text, new_text), kb, silent=silent)
+        await deliver(bot, owner.chat_id, edited_text(row, old_text, new_text), silent=silent)
     else:
         await deliver(bot, owner.chat_id, free_notice("edited", chat_label(message.chat)),
                       free_kb(message.chat.id), silent=silent)
@@ -1033,7 +1034,7 @@ async def on_deleted_business_messages(event: BusinessMessagesDeleted, bot: Bot)
                     "ℹ️ Содержимое не сохранено (сообщение пришло до подключения бота или до Премиума).")
             await deliver(bot, owner.chat_id, text, silent=silent)
             continue
-        await deliver(bot, owner.chat_id, deleted_text(row, versions), message_kb(row["id"], event.chat.id),
+        await deliver(bot, owner.chat_id, deleted_text(row, versions), None,
                       row["media_type"], row["media_path"], row["file_id"], silent=silent)
 
     if free_count:  # бесплатно — одно уведомление на всю пачку удалений
@@ -1058,7 +1059,7 @@ HELP_OWNER = (
 ADMIN_HELP = (
     "\n\n🛠 <b>Админ:</b>\n"
     "/admin — сводка\n"
-    "/backup — бэкап базы сейчас\n"
+    "/backup — бэкапы базы (скачать / сделать сейчас)\n"
     "/givepremium <i>user_id дни</i> — выдать Премиум\n"
     "/refund <i>user_id charge_id</i> — вернуть звёзды"
 )
@@ -1158,12 +1159,16 @@ async def cmd_delete_my_data(message: Message):
 
 
 @router.message(Command("history"))
+@router.message(Command(re.compile(r"h(\d+)$")))
 async def cmd_history(message: Message, command: CommandObject):
     if not await premium_guard(message):
         return
-    arg = (command.args or "").strip().lstrip("#")
+    if command.regexp_match:
+        arg = command.regexp_match.group(1)
+    else:
+        arg = (command.args or "").strip().lstrip("#")
     if not arg.isdigit():
-        await message.answer("ℹ️ Использование: <code>/history 123</code> — ID есть в каждом уведомлении (#123).")
+        await message.answer("ℹ️ Использование: <code>/history 123</code> — или нажмите /h123 в уведомлении.")
         return
     row = await db.get_message(int(arg))
     if not can_access(row, message.from_user.id):
@@ -1343,12 +1348,59 @@ async def cmd_admin(message: Message):
     )
 
 
+def list_backups() -> list[str]:
+    try:
+        names = [n for n in os.listdir(BACKUP_DIR) if re.fullmatch(r"backup_[\d\-_]+\.db\.gz", n)]
+    except FileNotFoundError:
+        return []
+    return sorted(names, reverse=True)
+
+
+def backups_view() -> tuple[str, InlineKeyboardMarkup]:
+    names = list_backups()
+    rows = []
+    for n in names:
+        size = os.path.getsize(os.path.join(BACKUP_DIR, n))
+        stamp = n[len("backup_"):-len(".db.gz")]  # 2026-11-18_0400
+        label = f"💾 {stamp[8:10]}.{stamp[5:7]} {stamp[11:13]}:{stamp[13:15]} · {human_size(size)}"
+        rows.append([Btn(text=label, callback_data=f"bk:{n}")])
+    rows.append([Btn(text="➕ Сделать бэкап сейчас", callback_data="bk:new")])
+    text = (f"💾 <b>Бэкапы базы</b>\n\nДелаются автоматически каждый день в {BACKUP_HOUR}:00 и хранятся на сервере "
+            f"(последние {BACKUP_KEEP}). Нажмите, чтобы скачать.\n<i>Медиафайлы в бэкап не входят.</i>")
+    if not names:
+        text += "\n\nПока бэкапов нет."
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @router.message(Command("backup"))
-async def cmd_backup(message: Message, bot: Bot):
+async def cmd_backup(message: Message):
     if message.from_user.id not in ADMIN_IDS:
         return
-    await message.answer("⏳ Готовлю бэкап…")
-    await send_backup(bot)
+    text, kb = backups_view()
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("bk:"))
+async def cb_backup(cb: CallbackQuery, bot: Bot):
+    if cb.from_user.id not in ADMIN_IDS:
+        await cb.answer("Нет доступа", show_alert=True)
+        return
+    name = cb.data[3:]
+    if name == "new":
+        await cb.answer("⏳ Делаю бэкап…")
+        await make_backup()
+        await edit_cb(cb, *backups_view())
+        return
+    if name not in list_backups():  # защита от подмены пути
+        await cb.answer("Бэкап не найден", show_alert=True)
+        return
+    path = os.path.join(BACKUP_DIR, name)
+    if os.path.getsize(path) > 49 * 1024 * 1024:
+        await cb.answer("Файл больше 50 МБ — Telegram не даст отправить. Скачайте через «Файлы» на хостинге.", show_alert=True)
+        return
+    await cb.answer("📤 Отправляю…")
+    await bot.send_document(cb.from_user.id, FSInputFile(path, filename=name),
+                            caption=f"💾 <b>Бэкап базы</b> · {human_size(os.path.getsize(path))}")
 
 
 @router.message(Command("givepremium"))
@@ -1675,40 +1727,26 @@ def _gzip_file(src: str, dst: str) -> None:
         shutil.copyfileobj(f_in, f_out)
 
 
-async def send_backup(bot: Bot) -> None:
-    if not ADMIN_IDS:
-        logger.warning("ADMIN_IDS не задан — бэкап некому отправить")
-        return
-    tmp_dir = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "backup_tmp")
-    os.makedirs(tmp_dir, exist_ok=True)
-    raw = os.path.join(tmp_dir, "backup.db")
-    gz = raw + ".gz"
+async def make_backup() -> Optional[str]:
+    """Тихо сохраняет сжатую копию базы в BACKUP_DIR и удаляет старые (оставляет BACKUP_KEEP)."""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    raw = os.path.join(BACKUP_DIR, "tmp_backup.db")
+    final = os.path.join(BACKUP_DIR, f"backup_{now():%Y-%m-%d_%H%M}.db.gz")
     try:
-        for p in (raw, gz):
-            if os.path.exists(p):
-                os.remove(p)
+        if os.path.exists(raw):
+            os.remove(raw)
         await db.conn.commit()
         await db.conn.execute("VACUUM INTO ?", (raw,))
-        await asyncio.to_thread(_gzip_file, raw, gz)
-        size = os.path.getsize(gz)
-        if size > 49 * 1024 * 1024:
-            await notify_admins(bot, f"⚠️ Бэкап слишком большой для Telegram ({human_size(size)}). Скачайте базу с сервера.")
-            return
-        caption = f"💾 <b>Бэкап базы</b> · {esc(ts())}\nРазмер: {human_size(size)}\n<i>Медиафайлы в бэкап не входят.</i>"
-        for admin_id in ADMIN_IDS:
-            try:
-                await bot.send_document(
-                    admin_id, FSInputFile(gz, filename=f"bot_archive_{now():%Y-%m-%d}.db.gz"), caption=caption
-                )
-            except Exception as e:
-                logger.warning("Не удалось отправить бэкап админу %s: %s", admin_id, e)
-        logger.info("Бэкап отправлен (%s)", human_size(size))
+        await asyncio.to_thread(_gzip_file, raw, final)
     finally:
-        for p in (raw, gz):
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+        try:
+            os.remove(raw)
+        except OSError:
+            pass
+    for old in list_backups()[BACKUP_KEEP:]:
+        remove_file(os.path.join(BACKUP_DIR, old))
+    logger.info("Бэкап сохранён: %s (%s)", final, human_size(os.path.getsize(final)))
+    return final
 
 
 async def premium_reminders(bot: Bot) -> None:
@@ -1747,7 +1785,11 @@ async def scheduler(bot: Bot) -> None:
             today = n.strftime("%Y-%m-%d")
             if n.hour >= BACKUP_HOUR and await db.get_meta("last_backup") != today:
                 await db.set_meta("last_backup", today)
-                await send_backup(bot)
+                try:
+                    await make_backup()
+                except Exception as e:  # пишем админам только если бэкап НЕ получился
+                    logger.exception("Ошибка бэкапа")
+                    await notify_admins(bot, f"⚠️ <b>Бэкап не сделан</b>\n<code>{esc(e)}</code>")
             if n.hour >= CLEANUP_HOUR and await db.get_meta("last_cleanup") != today:
                 await db.set_meta("last_cleanup", today)
                 await cleanup_old_data()
